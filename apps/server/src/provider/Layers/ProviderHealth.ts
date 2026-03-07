@@ -85,12 +85,13 @@ function isSpecificCommandMissingCause(
   error: unknown,
 ): boolean {
   if (!(error instanceof Error)) return false;
+  const target = command.toLowerCase();
   const lower = error.message.toLowerCase();
   return (
-    lower.includes(`command not found: ${command}`) ||
-    lower.includes(`spawn ${command} enoent`) ||
-    lower.includes('enoent') ||
-    lower.includes('notfound')
+    lower.includes(`command not found: ${target}`) ||
+    lower.includes(`spawn ${target} enoent`) ||
+    (lower.includes('enoent') && lower.includes(target)) ||
+    (lower.includes('notfound') && lower.includes(target))
   );
 }
 
