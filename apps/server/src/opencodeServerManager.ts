@@ -51,6 +51,7 @@ interface PendingQuestionRequest {
   readonly requestId: ApprovalRequestId;
   readonly questionIds: ReadonlyArray<string>;
   readonly questions: ReadonlyArray<{
+    readonly answerIndex: number;
     readonly id: string;
     readonly header: string;
     readonly question: string;
@@ -126,7 +127,7 @@ function buildAuthHeader(
 
 function parseServerUrl(output: string): string | undefined {
   const match = output.match(
-    /opencode server listening on\s+(https?:\/\/[^\s]+)/,
+    /opencode server listening on\s+(https?:\/\/[^\s]+)(?=\r?\n)/,
   );
   return match?.[1];
 }
@@ -466,22 +467,72 @@ export class OpenCodeServerManager extends EventEmitter<OpenCodeManagerEvents> {
       },
     });
 
-    await readJsonData(
-      context.client.session.promptAsync({
-        sessionID: context.providerSessionId,
-        ...(context.workspace ? { workspace: context.workspace } : {}),
-        ...(providerId && modelId
-          ? {
-              model: {
-                providerID: providerId,
-                modelID: modelId,
-              },
-            }
-          : {}),
-        ...(agent ? { agent } : {}),
-        parts: [textPart(input.input ?? '')],
-      }),
-    );
+    try {
+      await readJsonData(
+        context.client.session.promptAsync({
+          sessionID: context.providerSessionId,
+          ...(context.workspace ? { workspace: context.workspace } : {}),
+          ...(providerId && modelId
+            ? {
+                model: {
+                  providerID: providerId,
+                  modelID: modelId,
+                },
+              }
+            : {}),
+          ...(agent ? { agent } : {}),
+          parts: [textPart(input.input ?? '')],
+        }),
+      );
+    } catch (cause) {
+      const message =
+        cause instanceof Error ? cause.message : 'OpenCode failed to start turn';
+      context.activeTurnId = undefined;
+      context.lastError = message;
+      context.session = {
+        ...stripTransientSessionFields(context.session),
+        status: 'error',
+        updatedAt: nowIso(),
+        lastError: message,
+      };
+      this.emitRuntimeEvent({
+        type: 'runtime.error',
+        eventId: eventId('opencode-turn-start-error'),
+        provider: PROVIDER,
+        threadId: input.threadId,
+        createdAt: nowIso(),
+        turnId,
+        payload: {
+          message,
+          class: 'provider_error',
+        },
+      });
+      this.emitRuntimeEvent({
+        type: 'session.state.changed',
+        eventId: eventId('opencode-session-start-failed'),
+        provider: PROVIDER,
+        threadId: input.threadId,
+        createdAt: nowIso(),
+        turnId,
+        payload: {
+          state: 'error',
+          reason: message,
+        },
+      });
+      this.emitRuntimeEvent({
+        type: 'turn.completed',
+        eventId: eventId('opencode-turn-start-failed-completed'),
+        provider: PROVIDER,
+        threadId: input.threadId,
+        createdAt: nowIso(),
+        turnId,
+        payload: {
+          state: 'failed',
+          errorMessage: message,
+        },
+      });
+      throw cause;
+    }
 
     return {
       threadId: input.threadId,
@@ -532,16 +583,22 @@ export class OpenCodeServerManager extends EventEmitter<OpenCodeManagerEvents> {
       throw new Error(`Unknown OpenCode question request '${requestId}'`);
     }
 
-    const orderedAnswers = pending.questions.map((question) => {
+    const max = pending.questions.reduce(
+      (result, question) =>
+        question.answerIndex > result ? question.answerIndex : result,
+      -1,
+    );
+    const orderedAnswers = Array.from({ length: max + 1 }, () => [] as string[]);
+    for (const question of pending.questions) {
       const value = answers[question.id];
       if (Array.isArray(value)) {
-        return value.map(String);
+        orderedAnswers[question.answerIndex] = value.map(String);
+        continue;
       }
       if (typeof value === 'string' && value.length > 0) {
-        return [value];
+        orderedAnswers[question.answerIndex] = [value];
       }
-      return [];
-    });
+    }
 
     await readJsonData(
       context.client.question.reply({
@@ -1112,6 +1169,7 @@ export class OpenCodeServerManager extends EventEmitter<OpenCodeManagerEvents> {
         });
         return [
           {
+            answerIndex: index,
             id: `${requestIdValue}:${index}`,
             header,
             question: prompt,
@@ -1120,6 +1178,12 @@ export class OpenCodeServerManager extends EventEmitter<OpenCodeManagerEvents> {
         ];
       },
     );
+    const runtimeQuestions = questions.map((question) => ({
+      id: question.id,
+      header: question.header,
+      question: question.question,
+      options: question.options,
+    }));
 
     const requestId = ApprovalRequestId.makeUnsafe(requestIdValue);
     context.pendingQuestions.set(requestId, {
@@ -1136,7 +1200,7 @@ export class OpenCodeServerManager extends EventEmitter<OpenCodeManagerEvents> {
       ...(context.activeTurnId ? { turnId: context.activeTurnId } : {}),
       requestId: RuntimeRequestId.makeUnsafe(requestId),
       payload: {
-        questions,
+        questions: runtimeQuestions,
       },
       raw: {
         source: 'opencode.server.question',
@@ -1159,8 +1223,8 @@ export class OpenCodeServerManager extends EventEmitter<OpenCodeManagerEvents> {
     context.pendingQuestions.delete(requestIdValue);
     const answerArrays = asArray(event.answers) ?? [];
     const answers = Object.fromEntries(
-      (pending?.questions ?? []).map((question, index) => {
-        const answer = asArray(answerArrays[index]);
+      (pending?.questions ?? []).map((question) => {
+        const answer = asArray(answerArrays[question.answerIndex]);
         if (!answer) {
           return [question.id, ''];
         }
@@ -1225,7 +1289,8 @@ export class OpenCodeServerManager extends EventEmitter<OpenCodeManagerEvents> {
     event: OpencodeEvent,
   ): void {
     const part = asRecord(event.part);
-    if (asString(part?.sessionID) !== context.providerSessionId) {
+    const sessionId = asString(event.sessionID) ?? asString(part?.sessionID);
+    if (sessionId !== context.providerSessionId) {
       return;
     }
     const partId = asString(part?.id);
