@@ -1900,7 +1900,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
       : "local";
 
   useEffect(() => {
-    if (!isWorking) return;
+    if (phase !== "running") return;
     setNowTick(Date.now());
     const timer = window.setInterval(() => {
       setNowTick(Date.now());
@@ -1908,7 +1908,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
     return () => {
       window.clearInterval(timer);
     };
-  }, [isWorking]);
+  }, [phase]);
 
   const beginSendPhase = useCallback((nextPhase: Exclude<SendPhase, "idle">) => {
     setSendStartedAt((current) => current ?? new Date().toISOString());
